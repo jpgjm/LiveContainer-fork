@@ -1,0 +1,281 @@
+name: Build IPA (fork)
+
+# フォークで「IPA を作って SideStore で入れる」ためだけのワークフロー。
+#
+# 本家の build.yml との違い:
+#   - リリース処理を一切行わない (secrets 不要、権限不要)
+#   - SideStore 同梱版を作らない (外部ダウンロードに依存しない)
+#   - Xcode バージョンとランナーを workflow_dispatch から差し替えられる
+#   - 失敗時に調査用アーティファクトを集める
+#
+# 手動実行: Actions タブ → "Build IPA (fork)" → Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 使用するランナー (例 macos-26 / macos-15)
+        type: string
+        required: false
+        default: macos-26
+      xcode_version:
+        description: 使用する Xcode (例 latest-stable / 26.2)
+        type: string
+        required: false
+        default: latest-stable
+      openssl_ref:
+        description: OpenSSL サブモジュールの ref (空なら本家の固定コミットを自動解決)
+        type: string
+        required: false
+        default: ''
+      strict_xcframework_signature:
+        description: XCFramework の署名が一致しない場合にビルドを中止する
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - '.github/ISSUE_TEMPLATE/**'
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    env:
+      scheme: LiveContainer
+      archive_path: archive
+
+    steps:
+      - name: Show available Xcode versions
+        run: |
+          echo "=== インストール済み Xcode ==="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "=== 既定の Xcode ==="
+          xcodebuild -version
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ inputs.xcode_version || 'latest-stable' }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # GitHub の「Download ZIP」で取得したツリーを push したリポジトリでは、
+      # サブモジュールのディレクトリが**空のまま**になる (ZIP はサブモジュールを
+      # 含まない)。その場合 `submodules: recursive` は何もしないので、
+      # ここで実体を取りに行く。実フォークなら 1 行目で済む。
+      #
+      # OpenSSL は既定ブランチの最新を取ると、xcodeproj に記録された
+      # expectedSignature と噛み合わなくなる。そこで本家が固定している
+      # コミットを GitHub API で解決して、そのコミットを取得する。
+      - name: Ensure submodules
+        env:
+          OPENSSL_REF: ${{ inputs.openssl_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git submodule update --init --recursive || true
+
+          # 本家がサブモジュールとして固定している commit SHA を取得する
+          resolve_upstream_sha() {
+            path="$1"
+            curl -sSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/LiveContainer/LiveContainer/contents/$path" \
+            | jq -r 'if type == "object" and .type == "submodule" then .sha else empty end' \
+              2>/dev/null || true
+          }
+
+          clone_at_sha() {
+            dir="$1"; url="$2"; sha="$3"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            git -C "$dir" init -q
+            git -C "$dir" remote add origin "$url"
+            if git -C "$dir" fetch -q --depth 1 origin "$sha"; then
+              git -C "$dir" checkout -q FETCH_HEAD
+              echo "$dir: $sha を取得しました"
+              return 0
+            fi
+            echo "$dir: $sha の取得に失敗しました"
+            return 1
+          }
+
+          ensure() {
+            dir="$1"; url="$2"; ref="$3"; upstream_path="$4"
+            if [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+              echo "$dir: 取得済み"
+              return
+            fi
+            echo "$dir: 空なので取得します"
+
+            if [ -n "$ref" ]; then
+              rm -rf "$dir"
+              git clone -q --depth 1 --branch "$ref" "$url" "$dir"
+              echo "$dir: 指定された ref '$ref' を取得しました"
+              return
+            fi
+
+            sha="$(resolve_upstream_sha "$upstream_path")"
+            if [ -n "$sha" ] && clone_at_sha "$dir" "$url" "$sha"; then
+              return
+            fi
+
+            echo "$dir: 本家の固定コミットを解決できないため既定ブランチを取得します"
+            rm -rf "$dir"
+            git clone -q --depth 1 "$url" "$dir"
+          }
+
+          ensure OpenSSL  https://github.com/krzyzanowskim/OpenSSL   "$OPENSSL_REF" OpenSSL
+          ensure litehook https://github.com/LiveContainer/litehook  "" litehook
+          ensure fishhook https://github.com/LiveContainer/fishhook  "" fishhook
+
+          echo "=== サブモジュールの確認 ==="
+          for d in OpenSSL litehook fishhook; do
+            printf '%-10s %s files\n' "$d" "$(find "$d" -type f 2>/dev/null | wc -l | tr -d ' ')"
+          done
+
+          if [ ! -d OpenSSL/Frameworks/OpenSSL.xcframework ]; then
+            echo "::error::OpenSSL/Frameworks/OpenSSL.xcframework が見つかりません"
+            ls -la OpenSSL 2>/dev/null || true
+            ls -la OpenSSL/Frameworks 2>/dev/null || true
+            exit 1
+          fi
+          echo "OpenSSL.xcframework を確認しました"
+
+      # Xcode 15 以降は XCFramework の署名を検証する。
+      # xcodeproj には
+      #   expectedSignature = "AppleDeveloperProgram:67RAULRX93:Marcin Krzyzanowski"
+      # が記録されており、取得した xcframework の署名がこれと違うと
+      #   error: “OpenSSL.xcframework” is not signed with the expected identity
+      # で落ちる。本家の固定コミットを取れていれば一致するはずだが、
+      # 取れなかった場合に備えて実際の署名を照合し、食い違うときは
+      # 記録側を外してビルドを通す (既定)。
+      - name: Reconcile XCFramework signature
+        env:
+          STRICT: ${{ inputs.strict_xcframework_signature }}
+        run: |
+          PBX=LiveContainer.xcodeproj/project.pbxproj
+          XCF=OpenSSL/Frameworks/OpenSSL.xcframework
+
+          EXPECTED=$(grep -o 'expectedSignature = "[^"]*"' "$PBX" | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [ -z "$EXPECTED" ]; then
+            echo "expectedSignature の記録がありません。検証をスキップします"
+            exit 0
+          fi
+          EXPECTED_TEAM=$(echo "$EXPECTED" | cut -d: -f2)
+          echo "期待される署名   : $EXPECTED"
+          echo "期待されるチーム : $EXPECTED_TEAM"
+
+          ACTUAL_TEAM=$(codesign -dvv "$XCF" 2>&1 \
+            | awk -F= '/^TeamIdentifier=/{print $2}' | head -1)
+          echo "実際のチーム     : ${ACTUAL_TEAM:-(署名なし)}"
+
+          if [ "$ACTUAL_TEAM" = "$EXPECTED_TEAM" ]; then
+            echo "署名が一致しました。検証を有効なまま進めます"
+            exit 0
+          fi
+
+          echo "::warning::OpenSSL.xcframework の署名が期待値と一致しません " \
+               "(期待 $EXPECTED_TEAM / 実際 ${ACTUAL_TEAM:-署名なし})"
+
+          if [ "$STRICT" = "true" ]; then
+            echo "::error::strict_xcframework_signature が有効なため中止します"
+            exit 1
+          fi
+
+          echo "expectedSignature を xcodeproj から外してビルドを続行します"
+          sed -i '' 's/expectedSignature = "[^"]*"; //g' "$PBX"
+          if grep -q "expectedSignature" "$PBX"; then
+            echo "::error::expectedSignature を除去できませんでした"
+            exit 1
+          fi
+          echo "除去しました (このビルドのみ。リポジトリには影響しません)"
+
+      # 目的の 2 行が本当に埋め込まれているかを、ビルド前に確かめる。
+      # ここで落ちるなら Resources/Info.plist の編集が入っていない。
+      - name: Verify Quick Share service types in Info.plist
+        run: |
+          PLIST=Resources/Info.plist
+          echo "=== NSBonjourServices ==="
+          /usr/libexec/PlistBuddy -c "Print :NSBonjourServices" "$PLIST"
+          if /usr/libexec/PlistBuddy -c "Print :NSBonjourServices" "$PLIST" \
+              | grep -q "_FC9F5ED42C8A._tcp"; then
+            echo "Quick Share のサービスタイプが含まれています"
+          else
+            echo "::error::_FC9F5ED42C8A._tcp が NSBonjourServices にありません"
+            exit 1
+          fi
+
+      - name: Archive
+        id: archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -archivePath "$archive_path" \
+            -scheme "$scheme" \
+            -project LiveContainer.xcodeproj \
+            -sdk iphoneos \
+            -arch arm64 \
+            -configuration Release \
+            2>&1 | tee xcodebuild.log | xcpretty && exit ${PIPESTATUS[0]}
+
+      - name: Package IPA
+        run: sh .github/build_ipa_only.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-ipa
+          path: ${{ env.scheme }}.ipa
+          if-no-files-found: error
+
+      # --- 失敗時の調査用アーティファクト -------------------------------
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          mkdir -p build-failure
+          cp xcodebuild.log build-failure/ 2>/dev/null || true
+          grep -E "error:|error :" xcodebuild.log > build-failure/errors.txt 2>/dev/null || true
+          grep -E "warning:" xcodebuild.log > build-failure/warnings.txt 2>/dev/null || true
+          {
+            sw_vers
+            echo "---"
+            xcodebuild -version
+            echo "---"
+            ls -d /Applications/Xcode*.app 2>/dev/null || true
+          } > build-failure/environment.txt
+          cp Resources/Info.plist build-failure/ 2>/dev/null || true
+          {
+            echo "=== サブモジュールのファイル数 ==="
+            for d in OpenSSL litehook fishhook; do
+              printf '%-10s %s\n' "$d" "$(find "$d" -type f 2>/dev/null | wc -l | tr -d ' ')"
+            done
+          } > build-failure/submodules.txt 2>/dev/null || true
+
+      - name: Step summary on failure
+        if: failure()
+        run: |
+          echo "## ビルド失敗" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -n 60 build-failure/errors.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null \
+            || echo "(errors.txt なし)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure
+          path: build-failure
