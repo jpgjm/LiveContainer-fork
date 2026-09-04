@@ -1,0 +1,261 @@
+name: Build IPA (LCGuestIntent)
+
+# 本家 LiveContainer に LCGuestIntent だけを足したビルド。
+#
+# 本家 build.yml との違い:
+#   - release__nightly ジョブを走らせない (フォークでは secrets が無い)
+#   - SideStore 同梱版を作らない
+#       build_github.sh は LiveContainer.app/Metadata.appintents を
+#       SideStore のもので置き換える。アプリターゲットが自前の
+#       Metadata.appintents を持つようになると `cp -r` が入れ子を作るため、
+#       検証用のこのワークフローでは素の IPA だけを作る。
+#   - project.pbxproj を CI 内でパッチして LCGuestIntent.swift を追加する
+#       (リポジトリの pbxproj は変更しない)
+#   - ビルド後に Metadata.appintents を検査する
+#   - ZIP 展開を push したリポジトリでも通るよう submodule を自力で復旧する
+#
+# 手動実行: Actions タブ → "Build IPA (LCGuestIntent)" → Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 使用するランナー (例 macos-26 / macos-15)
+        type: string
+        required: false
+        default: macos-26
+      xcode_version:
+        description: 使用する Xcode (例 latest-stable / 26.2)
+        type: string
+        required: false
+        default: latest-stable
+      strict_xcframework_signature:
+        description: XCFramework の署名が一致しない場合にビルドを中止する
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main, master, guest-intent]
+    paths-ignore:
+      - '**.md'
+      - '.github/ISSUE_TEMPLATE/**'
+
+env:
+  # 本家 LiveContainer@12b1f782 (2026-08-30) がピン留めしている commit。
+  # 更新方法:
+  #   git clone --depth 1 --filter=blob:none --no-checkout \
+  #     https://github.com/LiveContainer/LiveContainer probe
+  #   git -C probe ls-tree HEAD | grep ^160000
+  OPENSSL_URL: https://github.com/krzyzanowskim/OpenSSL
+  OPENSSL_SHA: 623c84da314e85363236507ca38a4bde65df21c3
+  LITEHOOK_URL: https://github.com/LiveContainer/litehook
+  LITEHOOK_SHA: 8025e0c8ebdf5cdd1d2a4f45025813234bf9dc55
+
+jobs:
+  build:
+    name: Build unsigned IPA with LCGuestIntent
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    env:
+      scheme: LiveContainer
+      archive_path: archive
+
+    steps:
+      - name: Show available Xcode versions
+        run: |
+          echo "=== インストール済み Xcode ==="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "=== 既定の Xcode ==="
+          xcodebuild -version
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ inputs.xcode_version || 'latest-stable' }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # GitHub の Download ZIP は submodule の中身を含まない。
+      # ZIP を展開して push したリポジトリでは OpenSSL / litehook が空になり、
+      # submodules: recursive を指定しても復旧しない (gitlink がツリーに無いため)。
+      # 実フォークなら 1 行目の git submodule update で済む。
+      - name: Ensure submodules
+        run: |
+          set -e
+          git submodule update --init --recursive || true
+
+          fetch_pinned() {
+            dir="$1"; url="$2"; sha="$3"
+            echo "----- $dir -----"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            git -C "$dir" init -q
+            git -C "$dir" remote add origin "$url"
+            git -C "$dir" fetch -q --depth 1 origin "$sha"
+            git -C "$dir" checkout -q FETCH_HEAD
+            echo "$dir <- $sha ($(find "$dir" -type f | wc -l | tr -d ' ') files)"
+          }
+
+          if [ -e OpenSSL/Frameworks/OpenSSL.xcframework ] && [ -e litehook/src ]; then
+            echo "submodule は展開済みです。何もしません。"
+          else
+            fetch_pinned OpenSSL  "$OPENSSL_URL"  "$OPENSSL_SHA"
+            fetch_pinned litehook "$LITEHOOK_URL" "$LITEHOOK_SHA"
+          fi
+
+          # .gitmodules には fishhook も載っているが、本家のツリーに gitlink が
+          # 無い (削除済みの残骸) うえ pbxproj からも参照されていないので取得しない。
+
+          [ -e OpenSSL/Frameworks/OpenSSL.xcframework ] || {
+            echo "::error::OpenSSL.xcframework が用意できませんでした"; exit 1; }
+          [ -e litehook/src ] || {
+            echo "::error::litehook のソースが用意できませんでした"; exit 1; }
+
+      # Xcode 15 以降は XCFramework の署名を検証する。pbxproj に
+      #   expectedSignature = "AppleDeveloperProgram:67RAULRX93:Marcin Krzyzanowski"
+      # が記録されており、食い違うとビルドが落ちる。
+      - name: Reconcile XCFramework signature
+        env:
+          STRICT: ${{ inputs.strict_xcframework_signature }}
+        run: |
+          PBX=LiveContainer.xcodeproj/project.pbxproj
+          XCF=OpenSSL/Frameworks/OpenSSL.xcframework
+
+          EXPECTED=$(grep -o 'expectedSignature = "[^"]*"' "$PBX" | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [ -z "$EXPECTED" ]; then
+            echo "expectedSignature の記録がありません。検証をスキップします"
+            exit 0
+          fi
+          EXPECTED_TEAM=$(echo "$EXPECTED" | cut -d: -f2)
+          ACTUAL_TEAM=$(codesign -dvv "$XCF" 2>&1 \
+            | awk -F= '/^TeamIdentifier=/{print $2}' | head -1)
+          echo "期待 $EXPECTED_TEAM / 実際 ${ACTUAL_TEAM:-(署名なし)}"
+
+          if [ "$ACTUAL_TEAM" = "$EXPECTED_TEAM" ]; then
+            echo "一致しました"
+            exit 0
+          fi
+          if [ "$STRICT" = "true" ]; then
+            echo "::error::署名が一致しません (strict 指定のため中止)"
+            exit 1
+          fi
+          echo "::warning::署名が一致しないため expectedSignature を外して続行します"
+          sed -i '' 's/expectedSignature = "[^"]*"; //g' "$PBX"
+
+      - name: Add LCGuestIntent.swift to the LiveContainer target
+        run: python3 .github/scripts/add_guest_intent.py
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -archivePath "$archive_path" \
+            -scheme "$scheme" \
+            -project LiveContainer.xcodeproj \
+            -sdk iphoneos \
+            -arch arm64 \
+            -configuration Release \
+            2>&1 | tee xcodebuild.log | xcpretty && exit ${PIPESTATUS[0]}
+
+      # 検証の本体。ここが通らなければ実機に持っていく意味がない。
+      - name: Inspect AppIntents metadata
+        run: |
+          set -e
+          APP="$archive_path.xcarchive/Products/Applications/LiveContainer.app"
+          META="$APP/Metadata.appintents"
+
+          if [ ! -d "$META" ]; then
+            echo "::error::$APP/Metadata.appintents が生成されていません"
+            echo "アプリターゲットへの Swift ファイル追加が効いていない可能性があります"
+            exit 1
+          fi
+          ls -la "$META"
+
+          DATA="$META/extract.actionsdata"
+          [ -f "$DATA" ] || { echo "::error::extract.actionsdata がありません"; exit 1; }
+
+          echo "----- 登録されている型 (mangledTypeNameV2) -----"
+          strings "$DATA" | grep -o '"mangledTypeNameV2":"[^"]*"' | sort -u || true
+
+          echo "----- identifier -----"
+          strings "$DATA" | grep -o '"identifier":"[^"]*"' | sort -u | head -40 || true
+
+          if strings "$DATA" | grep -qi "LCGuestIntent\|com.kdt.livecontainer.guestIntent"; then
+            echo ""
+            echo ">>> LCGuestIntent を発見しました <<<"
+            strings "$DATA" | grep -i "guestintent" | sort -u
+            {
+              echo "## LCGuestIntent 検出"
+              echo ""
+              echo '```'
+              strings "$DATA" | grep -o '"mangledTypeNameV2":"[^"]*GuestIntent[^"]*"' | sort -u
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::LCGuestIntent が Metadata.appintents に含まれていません"
+            exit 1
+          fi
+
+      # 本家 build_github.sh の前半だけに相当する処理。
+      # SideStore 合成は行わない (Metadata.appintents が上書きされるため)。
+      - name: Package LiveContainer.ipa
+        run: |
+          set -e
+          mv "$archive_path.xcarchive/Products/Applications" Payload
+          APP=Payload/LiveContainer.app
+          mkdir -p tmp
+          if [ -d "$APP/Frameworks/SideStoreSupport.framework" ]; then
+            mv "$APP/Frameworks/SideStoreSupport.framework" ./tmp/
+          fi
+          zip -qr "$scheme.ipa" Payload -x "._*" -x ".DS_Store" -x "__MACOSX"
+          ls -lh "$scheme.ipa"
+
+      - name: Upload LiveContainer.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-guestintent-ipa
+          path: ${{ env.scheme }}.ipa
+          if-no-files-found: error
+
+      - name: Upload AppIntents metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: Metadata-appintents
+          path: Payload/LiveContainer.app/Metadata.appintents
+          if-no-files-found: warn
+
+      # --- 失敗時の調査用 -----------------------------------------------
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          mkdir -p build-failure
+          cp xcodebuild.log build-failure/ 2>/dev/null || true
+          grep -E "error:|error :" xcodebuild.log > build-failure/errors.txt 2>/dev/null || true
+          cp LiveContainer.xcodeproj/project.pbxproj build-failure/ 2>/dev/null || true
+          {
+            sw_vers; echo "---"; xcodebuild -version; echo "---"
+            echo "LCGuestIntent.swift:"
+            find . -name LCGuestIntent.swift -not -path "./.git/*" 2>/dev/null || true
+            echo "submodules:"
+            for d in OpenSSL litehook; do
+              printf '%-10s %s\n' "$d" "$(find "$d" -type f 2>/dev/null | wc -l | tr -d ' ')"
+            done
+          } > build-failure/context.txt 2>/dev/null || true
+
+      - name: Step summary on failure
+        if: failure()
+        run: |
+          echo "## ビルド失敗" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -n 60 build-failure/errors.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null \
+            || echo "(errors.txt なし)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure
+          path: build-failure
